@@ -2,9 +2,9 @@
 
 > 数据来源：CANN 9.1.0 / 昇腾 910B2 / ARM aarch64 实测
 > 抓取方法：strace -ff + libascend_hal.so 二进制反汇编
-> 负载 A：torch_npu 矩阵乘法 (`torch.randn(64,64,device='npu:0').mm(...)`)
+> 负载 A：torch_npu 矩阵乘法 + 推理（torch 2.9.0 + torch_npu 2.9.0）
 > 负载 B：ACL ctypes 直接调用 (`libascendcl.so` — 内存/流/事件/异常)
-> 合并统计：strace 覆盖 43 种 + 二进制补全 38 种 = 81 种
+> 合并统计：strace 覆盖 48 种 + 二进制补全 33 种 = 81 种
 
 ---
 
@@ -14,7 +14,7 @@
 |------|---------|------|-----------|-----------|
 | `/dev/davinci_manager` | 504:0 | 设备管理器（主 ioctl 通道） | O_RDWR | ~75 种 |
 | `/dev/davinci1` | 503:1 | NPU 计算设备 | O_RDONLY | 归属不明（fd 复用） |
-| `/dev/hisi_hdc` | 501:0 | 高速数据通道（Host↔Device） | O_RDWR | 9 种（strace 确认 6 种） |
+| `/dev/hisi_hdc` | 501:0 | 高速数据通道（Host↔Device） | O_RDWR | 9 种（strace 全确认 ✅） |
 | `/dev/devmm_svm` | 502:0 | 虚拟内存管理 | 权限不足 | 未抓到 |
 
 ---
@@ -149,7 +149,9 @@
 |------|-----|------|---------|---------|
 | RW | 0x00 | 0x1c (28B) | 设备属性查询 | 安全 |
 | WRITE | 0x01 | 0x1c (28B) | 设备属性设置 | 受限 |
+| RW | 0x04 | 0x1c (28B) | 算子参数查询（推理触发） | 安全 |
 | RW | 0x05 | 0x1c (28B) | 平台参数读写（高频） | 受限 |
+| RW | 0x06 | 0x1c (28B) | 算子参数查询（推理触发） | 安全 |
 | RW | 0x0a | 0x1c (28B) | 未知 | 待验证 |
 | RW | 0x0b | 0x04 (4B) | 开关量查询 | 安全 |
 | RW | 0x0c | 0x08 (8B) | 计数器查询 | 安全 |
@@ -180,23 +182,23 @@
 
 ---
 
-## 4. hisi_hdc ioctl 目录（Magic 0x48，9 种）
+## 4. hisi_hdc ioctl 目录（Magic 0x48，9 种，全部 strace 确认 ✅）
 
-| 方向 | nr | size | strace | 二进制 | 推测功能 | 安全等级 |
-|------|-----|------|--------|--------|---------|----------|
-| NONE | 0x07 | 0 | ✅ | | HDC 通道初始化 | 安全 |
-| NONE | 0x08 | 0 | ✅ | | HDC 通道配置 | 安全 |
-| NONE | 0x10 | 0 | 仅 torch_npu | | HDC 数据传输准备 | 受限 |
-| NONE | 0x13 | 0 | ✅ | | HDC 状态查询（高频） | 安全 |
-| NONE | 0x17 | 0 | ✅ | | HDC 数据传输 | 受限 |
-| NONE | 0x18 | 0 | ✅ | | HDC 完成确认 | 安全 |
-| NONE | 0x1d | 0 | ✅ | | HDC 通道关闭 | 安全 |
-| NONE | 0x42 | 0 | 仅 torch_npu | | HDC 扩展命令 | 待验证 |
-| NONE | 0x43 | 0 | 仅 torch_npu | | HDC 扩展命令 | 待验证 |
+| 方向 | nr | size | strace | 触发条件 | 推测功能 | 安全等级 |
+|------|-----|------|--------|---------|---------|----------|
+| NONE | 0x07 | 0 | ✅ | ACL + torch | HDC 通道初始化 | 安全 |
+| NONE | 0x08 | 0 | ✅ | ACL + torch | HDC 通道配置 | 安全 |
+| NONE | 0x10 | 0 | ✅ | torch 推理 | HDC 数据传输准备 | 受限 |
+| NONE | 0x13 | 0 | ✅ | ACL + torch | HDC 状态查询（高频） | 安全 |
+| NONE | 0x17 | 0 | ✅ | ACL + torch | HDC 数据传输 | 受限 |
+| NONE | 0x18 | 0 | ✅ | ACL + torch | HDC 完成确认 | 安全 |
+| NONE | 0x1d | 0 | ✅ | ACL + torch | HDC 通道关闭 | 安全 |
+| NONE | 0x42 | 0 | ✅ | torch 推理 | HDC 扩展命令 | 待验证 |
+| NONE | 0x43 | 0 | ✅ | torch 推理 | HDC 扩展命令 | 待验证 |
 
 **特征**：全部 NONE 方向，纯命令无数据传输。HDC 是 Host-Device Communication 通道，用于在 host 和 NPU 之间传输控制消息。
 
-**ACL ctypes 验证**：纯 ACL 调用（不经过 torch_npu）仅触发 6 种（0x07/0x08/0x13/0x17/0x18/0x1d），缺失的 0x10/0x42/0x43 需要 torch_npu 的完整推理路径才能触发。
+**关键发现**：0x10/0x42/0x43 仅在 torch_npu 推理路径（`torch.nn.Linear().npu()` + forward）中触发，ACL ctypes 直接调用无法触发。
 
 ---
 
@@ -356,13 +358,14 @@
 | 指标 | 数值 |
 |------|------|
 | 总 magic 号数 | 8 |
-| 总 ioctl 种类（去重） | ~81 |
-| strace 抓到的（torch_npu + ACL ctypes 合并） | 43 |
-| 二进制独有（strace 未触发） | 38 |
+| 总 ioctl 种类（去重） | 81 |
+| strace 抓到的（torch_npu 推理 + ACL ctypes 合并） | 48 |
+| 二进制独有（strace 未触发） | 33 |
 | 双方确认的 | 4 |
-| 已分类安全等级 | 43 |
-| 待验证 | 38 |
-| 仅 torch_npu 能触发的 | 7（nr=0x12/0xa3/0xaf/0x1d/0x10/0x42/0x43） |
+| 已分类安全等级 | 48 |
+| 待验证 | 33 |
+| hisi_hdc 覆盖率 | 9/9 (100%) ✅ |
+| davinci_manager strace 覆盖 | 39/~75 (52%) |
 
 ---
 
