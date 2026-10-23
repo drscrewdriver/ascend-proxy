@@ -161,22 +161,67 @@ func frontendIoctlSimple[Params any, PtrParams hasStatusPtr[Params]](
 
 ### 2.7 runsc CLI 层集成链路（阶段 C）
 
-```
-runsc --nvproxy          ┐
-                          │  runsc/config/config.go 定义 flag
-OCI spec annotation       │  runsc/specutils/nvidia.go:NVProxyEnabled()
-  ↓                        │
-boot.NewSentry()         │  runsc/boot/loader.go
-  ↓                        │
-nvproxy.Register(vfs, opts)   ← 入口！我们写 ascendproxy.Register 同位
-  ↓                        │
-创建 frontendDevice{minor}, 注册到 virtualFilesystem
-  ↓                        │
-容器 open("/dev/nvidia0") → Sentry VFS 匹配到 frontendDevice →
-返回 frontendFD，后续 ioctl 自动分发到 frontendFD.Ioctl
+**实际插入点已定位**：`runsc/boot/vfs.go:1939` 已有完全同构的 `nvproxyRegisterDevices()`：
+
+```go
+func nvproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem,
+                            nvidiaDriverVersion nvconf.DriverVersion) error {
+    if !specutils.NVProxyEnabled(info.spec, info.conf) {
+        return nil   // 开关控制
+    }
+    driverCaps, err := specutils.NVProxyDriverCapsAllowed(info.conf)
+    if err != nil { return err }
+    devInfo, err := nvproxy.Register(vfsObj, &nvproxy.Options{
+        DriverVersion: nvidiaDriverVersion,
+        DriverCaps:    driverCaps,
+        // ...
+    })
+    if err != nil { return fmt.Errorf("registering nvproxy driver: %w", err) }
+    info.nvproxyDevInfo = devInfo
+    return nil
+}
 ```
 
-关键 API：`vfs.VirtualFilesystem.RegisterDeviceAtPath("/dev/davinci_manager", &davinciDevice{})`
+**ascendproxy 完全同构实现**：
+
+```go
+func ascendproxyRegisterDevices(info *containerInfo, vfsObj *vfs.VirtualFilesystem) error {
+    if !specutils.AscendProxyEnabled(info.spec, info.conf) {
+        return nil
+    }
+    caps, err := specutils.AscendProxyCapsAllowed(info.conf)
+    if err != nil { return err }
+    _, err = ascendproxy.Register(vfsObj, &ascendproxy.Options{
+        CANNVersion: "9.1.0",
+        Caps:        caps,
+    })
+    return err
+}
+```
+
+### 2.7 完整集成链路
+
+```
+runsc --ascendproxy                     ← 新 flag (pkg/sentry/sentry.go)
+    ↓
+runsc/config/config.go                   ← 定义 AscendProxy bool flag
+    ↓
+runsc/specutils/ascend.go (新增)         ← AscendProxyEnabled() / 检测 OCI annotation
+    ↓
+runsc/boot/vfs.go                        ← ascendproxyRegisterDevices() 新函数
+    ↓
+ascendproxy.Register(vfsObj, opts)       ← pkg/sentry/devices/ascendproxy/ascendproxy.go
+    ↓
+vfsObj.RegisterDevice(CharDevice, 504, 0, davinciDevice{}, opts)
+    ↓
+容器 open("/dev/davinci_manager") → davinciDevice.Open() → davinciFD
+    ↓
+容器 ioctl → davinciFD.Ioctl → 白名单 → RawSyscall(hostFD, ...)
+    ↓
+真设备 → 回结果给容器
+```
+
+关键 API：`vfsObj.RegisterDevice(vfs.CharDevice, major, minor, device, opts)`
 
 ### 2.8 待调研项（下一步）
 
