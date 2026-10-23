@@ -2,7 +2,9 @@
 
 > 数据来源：CANN 9.1.0 / 昇腾 910B2 / ARM aarch64 实测
 > 抓取方法：strace -ff + libascend_hal.so 二进制反汇编
-> 负载：torch_npu 矩阵乘法 (`torch.randn(64,64,device='npu:0').mm(...)`)
+> 负载 A：torch_npu 矩阵乘法 (`torch.randn(64,64,device='npu:0').mm(...)`)
+> 负载 B：ACL ctypes 直接调用 (`libascendcl.so` — 内存/流/事件/异常)
+> 合并统计：strace 覆盖 43 种 + 二进制补全 38 种 = 81 种
 
 ---
 
@@ -12,7 +14,7 @@
 |------|---------|------|-----------|-----------|
 | `/dev/davinci_manager` | 504:0 | 设备管理器（主 ioctl 通道） | O_RDWR | ~75 种 |
 | `/dev/davinci1` | 503:1 | NPU 计算设备 | O_RDONLY | 归属不明（fd 复用） |
-| `/dev/hisi_hdc` | 501:0 | 高速数据通道（Host↔Device） | O_RDWR | 9 种 |
+| `/dev/hisi_hdc` | 501:0 | 高速数据通道（Host↔Device） | O_RDWR | 9 种（strace 确认 6 种） |
 | `/dev/devmm_svm` | 502:0 | 虚拟内存管理 | 权限不足 | 未抓到 |
 
 ---
@@ -180,19 +182,21 @@
 
 ## 4. hisi_hdc ioctl 目录（Magic 0x48，9 种）
 
-| 方向 | nr | size | 出现 PID | 推测功能 | 安全等级 |
-|------|-----|------|---------|---------|---------|
-| NONE | 0x07 | 0 | 1044 | HDC 通道初始化 | 安全 |
-| NONE | 0x08 | 0 | 1044 | HDC 通道配置 | 安全 |
-| NONE | 0x10 | 0 | 1044, 1063 | HDC 数据传输准备 | 受限 |
-| NONE | 0x13 | 0 | 1044, 1049 | HDC 状态查询（高频） | 安全 |
-| NONE | 0x17 | 0 | 1044, 1049 | HDC 数据传输 | 受限 |
-| NONE | 0x18 | 0 | 1044, 1049, 1065 | HDC 完成确认 | 安全 |
-| NONE | 0x1d | 0 | 1044 | HDC 通道关闭 | 安全 |
-| NONE | 0x42 | 0 | 1063 | HDC 扩展命令 | 待验证 |
-| NONE | 0x43 | 0 | 1063 | HDC 扩展命令 | 待验证 |
+| 方向 | nr | size | strace | 二进制 | 推测功能 | 安全等级 |
+|------|-----|------|--------|--------|---------|----------|
+| NONE | 0x07 | 0 | ✅ | | HDC 通道初始化 | 安全 |
+| NONE | 0x08 | 0 | ✅ | | HDC 通道配置 | 安全 |
+| NONE | 0x10 | 0 | 仅 torch_npu | | HDC 数据传输准备 | 受限 |
+| NONE | 0x13 | 0 | ✅ | | HDC 状态查询（高频） | 安全 |
+| NONE | 0x17 | 0 | ✅ | | HDC 数据传输 | 受限 |
+| NONE | 0x18 | 0 | ✅ | | HDC 完成确认 | 安全 |
+| NONE | 0x1d | 0 | ✅ | | HDC 通道关闭 | 安全 |
+| NONE | 0x42 | 0 | 仅 torch_npu | | HDC 扩展命令 | 待验证 |
+| NONE | 0x43 | 0 | 仅 torch_npu | | HDC 扩展命令 | 待验证 |
 
 **特征**：全部 NONE 方向，纯命令无数据传输。HDC 是 Host-Device Communication 通道，用于在 host 和 NPU 之间传输控制消息。
+
+**ACL ctypes 验证**：纯 ACL 调用（不经过 torch_npu）仅触发 6 种（0x07/0x08/0x13/0x17/0x18/0x1d），缺失的 0x10/0x42/0x43 需要 torch_npu 的完整推理路径才能触发。
 
 ---
 
@@ -303,24 +307,70 @@
 
 ---
 
-## 8. 统计
+## 8. ACL ctypes 交叉验证
+
+> 时间：2026-10-24，在 AutoDL 昇腾 910B2 实例上通过 `ctypes.CDLL('libascendcl.so')` 直接调用 ACL API
+
+### 8.1 负载覆盖
+
+| 族 | 负载内容 | 结果 |
+|----|---------|------|
+| B 内存 | `aclrtMalloc(64/256/1K/4K/1M/4M)` + `aclrtFree` | ✅ 成功，触发 9 条 ioctl |
+| C 流/事件 | `aclrtCreateStream` ×4 + `SynchronizeStream` + `CreateEvent` ×4 | ⚠️ 部分成功，`RecordEvent` 时 segfault |
+| D 矩阵运算 | 未跑（容器无 torch） | — |
+| E 模型推理 | 未跑（无 .om 模型） | — |
+| F 多卡通信 | 未跑（单卡环境） | — |
+| G 异常路径 | `Malloc(60GB)` + `Free(NULL)` + `SetDevice(99)` + `Memcpy overflow` | ✅ 全部返回错误码，触发 9 条 ioctl |
+
+### 8.2 ACL ctypes vs torch_npu 对比
+
+| ioctl | ACL ctypes | torch_npu | 说明 |
+|-------|-----------|-----------|------|
+| 0x4d NONE nr=0x03 | ✅ | ✅ | 双方均触发（设备初始化） |
+| 0x4d RW nr=0x11 | ✅ | ✅ | ACL 触发 RW 方向，torch 触发 NONE 方向 |
+| 0x4d NONE nr=0x12 | ❌ | ✅ | 仅 torch_npu 触发（上下文查询） |
+| 0x4d NONE nr=0xa3 | ❌ | ✅ | 仅 torch_npu 触发（资源分配） |
+| 0x4d NONE nr=0xaf | ❌ | ✅ | 仅 torch_npu 触发 |
+| 0x45 NONE nr=0x1d | ❌ | ✅ | 仅 torch_npu 触发（设备状态查询） |
+| 0x48 NONE nr=0x10 | ❌ | ✅ | 仅 torch_npu 的完整推理路径触发 |
+| 0x48 NONE nr=0x42/0x43 | ❌ | ✅ | 仅 torch_npu 触发 |
+
+### 8.3 初始化时序（ACL ctypes 实测）
+
+```
+[0] 0x55 READ  nr=0x00  ← 第一个 ioctl，读设备能力
+[1] 0x55 WRITE nr=0x01  ← 设置设备模式
+[2] 0x4d NONE  nr=0x6c  ← 设备管理命令
+[5] 0x4d NONE  nr=0x9a  ← 设备管理命令
+[6-8] 0x4d NONE nr=0x03 × 3  ← 设备初始化（重复 3 次）
+[9] 0x45 NONE  nr=0x17  ← 🔑 解锁 ioctl
+[10-11] 0x4d NONE nr=0x14 × 2  ← 资源查询
+```
+
+**关键发现**：0x55 READ nr=0x00 是全局第一个 ioctl（早于 0x45 解锁），说明设备能力探测在解锁之前。
+
+---
+
+## 9. 统计
 
 | 指标 | 数值 |
 |------|------|
 | 总 magic 号数 | 8 |
-| 总 ioctl 种类（去重） | ~84 |
-| strace 抓到的 | ~46 |
-| 二进制独有（strace 未触发） | ~38 |
+| 总 ioctl 种类（去重） | ~81 |
+| strace 抓到的（torch_npu + ACL ctypes 合并） | 43 |
+| 二进制独有（strace 未触发） | 38 |
 | 双方确认的 | 4 |
-| 已分类安全等级 | 46 |
-| 待验证 | ~38 |
+| 已分类安全等级 | 43 |
+| 待验证 | 38 |
+| 仅 torch_npu 能触发的 | 7（nr=0x12/0xa3/0xaf/0x1d/0x10/0x42/0x43） |
 
 ---
 
-## 9. 下一步
+## 10. 下一步
 
-1. **扩展负载覆盖**：用 ACL C 程序触发更多 ioctl（内存分配、流创建、模型推理）
+1. **torch_npu 环境补抓**：安装 torch/torch_npu 后重跑，补全 7 种专属 ioctl
 2. **结构体推断**：根据 size 字段推断每个 ioctl 的参数结构体布局
 3. **0x5a/0x89 族归属**：确定这两个 magic 号对应的设备和功能
 4. **devmm_svm ioctl**：获取 `/dev/devmm_svm` 的访问权限后抓取虚拟内存管理 ioctl
 5. **白名单精化**：根据安全等级分类实现 proxy 的过滤规则
+6. **阶段二启动**：基于 43 种已确认 ioctl 编写 proxy 骨架
