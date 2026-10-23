@@ -55,49 +55,79 @@ ascend-ioctl-proxy ←─────┘
 
 ---
 
-### 阶段三：OCI Runtime 包装（第 6-7 周）
+### 阶段三：gVisor 铺垫（第 6-8 周）
+
+> 方向调整：不再自写 OCI runtime wrapper（gVisor 本身就是完整 OCI runtime），
+> 直接以 gVisor 为集成目标。阶段二完成的 C 代理保留为独立分支（可单独部署），
+> 阶段三产出为集成铺好的认知地基。
 
 | 周 | 任务 | 产出 | AI 辅助 |
 |----|------|------|---------|
-| W6 | 学习 OCI runtime spec（读规范 + 看 runc 源码关键路径） | 理解 spec 结构 | AI 解读规范文档 |
-| W6 | 写 `ascend-oci-runtime` wrapper（Go/Rust） | 能替代 runc 的空壳 | AI 生成 wrapper 代码 |
-| W7 | 实现：修改 OCI spec，把 `/dev/davinci0` 替换为代理设备 | spec 修改逻辑 | AI 辅助 JSON 操作 |
-| W7 | 实现：启动 proxy 进程 + 调用 runc | 完整 runtime | AI 调试进程管理 |
-| W7 | 接入 containerd 测试（端到端：Pod 申请 → NPU 可见） | 可演示的 demo | — |
+| W6 | 搭 gVisor 本地开发环境（Go 1.21+ / bazel / Linux ≥ 5.10） | `bazel test //test/...` 基线全绿 | AI 排错 |
+| W6-W7 | 精读 nvproxy 源码（`pkg/sentry/devices/nvproxy/`） | 标注好的代码阅读笔记 | AI 解释 Go 上下文 |
+| W7 | 运行官方 nvproxy example（CUDA 容器 in gVisor） | 能复现 NVIDIA 例子的实验记录 | — |
+| W7-W8 | 拆解 Sentry device 注册机制（vfs / fdtable / platform） | 文字 + 图 | AI 提炼 |
+| W8 | 写 `docs/gvisor-integration-analysis.md`（=阶段 4a 产物） | 集成方案文档 | AI 辅助文档结构 |
 
-**阶段产出**：`ascend-oci-runtime` + containerd 集成验证截图
+**阶段产出**：集成分析文档 + 能熟读 gVisor 代码的能力
 
 ---
 
-### 阶段四：沙箱集成（第 8-11 周，可选进阶）
+### 阶段四：gVisor 集成与开源（第 9-14 周）
 
-| 周 | 任务 | 产出 | AI 辅助 |
-|----|------|------|---------|
-| W8-9 | 方案 A：fork gVisor，扩展 `--nvproxy` 思路支持 Ascend | gVisor fork + patch | AI 读 gVisor 源码 |
-| W8-9 | 方案 B（更简单）：用 seccomp 白名单限制容器只能发 NPU ioctl | seccomp profile | AI 生成 seccomp 规则 |
-| W10 | 安全测试：尝试在沙箱内发起危险 ioctl，验证被拦截 | 安全测试报告 | AI 生成攻击用例 |
-| W10 | 性能测试：对比直通 vs 代理的延迟开销 | 性能对比数据 | AI 分析数据 |
-| W11 | 整理文档 + 开源发布（GitHub + README + 架构图） | 开源项目 | AI 写文档 |
+#### 4a：集成方案设计（已含在阶段三的尾期）
 
-**阶段产出**：可开源的完整项目（GitHub 仓库）
+产出：`docs/gvisor-integration-analysis.md`，内容：
+- nvproxy 三层分层→ ascend-proxy 对应映射
+- Sentry 侧需要的 Go device handler 接口定义
+- frontend 协议适配方案（复用阶段二 proxy_main.c）
+- 白名单从 catalog 自动导出为 Go 表的脚本
+
+#### 4b：Fork gVisor + ascendproxy 子系统（主体实现）
+
+| 周 | 任务 | 产出 |
+|----|------|------|
+| W9-W10 | 在 fork 中新增 `pkg/sentry/devices/ascendproxy/` 骨架 | Go 代码模块 + 单元测试 |
+| W10 | 实现 `/dev/davinci_manager` 伪设备 (Go) | vfs.Device 接口实现 |
+| W10-W11 | 实现 `/dev/hisi_hdc` 伪设备 | 同上 |
+| W11 | 适配阶段二 proxy_main.c 为 frontend 协议 | C 代码改造 + 接口测试 |
+| W11-W12 | 白名单自动导出：catalog.md → whitelist.go | 代码生成脚本 |
+| W12-W13 | 集成测试：`runsc --ascendproxy` + torch_npu | e2e 实验报告 |
+| W13 | 安全测试：尝试绕过、伪造 ioctl | 安全测试报告 |
+| W13-W14 | 性能基准：直通 vs gVisor+proxy | 对比数据表 |
+
+**产出**：gVisor fork + 可直接 `bazel run //:runsc` 的完整集成
+
+#### 4c：开源发布与文档
+
+| 任务 | 产出 |
+|------|------|
+| 写 blog 系列：`blog/` 目录，包含逆向→代理→集成三篇 | 技术博客 |
+| README 升级：架构图 + 快速开始 + FAQ | 开门户入口 |
+| 向 gVisor 上游提 RFC/Issue（先存于自己 fork） | 上游开场 |
+| 可选：提交 gvisor.dev 官方 mailing list | 社区互动 |
+
+**产出**：开源项目完整上线 + 可写进简历的集成实现
+
+---
 
 ---
 
 ## 里程碑总览
 
 ```
-W1-W2   ████░░░░░░░░░░░░░░░░  阶段一：抓接口 → ioctl catalog
-W3-W5   ░░░░██████░░░░░░░░░░  阶段二：最小代理 → proxy 二进制
-W6-W7   ░░░░░░░░░░████░░░░░░  阶段三：OCI wrapper → 端到端 demo
-W8-W11  ░░░░░░░░░░░░░░██████  阶段四：沙箱集成 → 开源项目（可选）
+W1-W2   ████░░░░░░░░░░░░░░░░  阶段一：抓接口 → ioctl catalog ✅
+W3-W5   ░░░░██████░░░░░░░░░░  阶段二：最小代理 → proxy 二进制（分支保留）
+W6-W8   ░░░░░░░░░░████░░░░░░  阶段三：gVisor 铺垫 → 集成分析文档
+W9-W14  ░░░░░░░░░░░░░░██████  阶段四：集成实现 + 开源发布（4a/4b/4c）
 ```
 
 | 里程碑 | 时间 | 交付物 | 验证标准 |
 |--------|------|--------|---------|
-| M1 | W2 末 | `ascend-ioctl-catalog.md` | 至少列出 10 个 ioctl 及用途 |
-| M2 | W5 末 | `ascend-ioctl-proxy` | 能代理 3 种以上 ioctl 并返回正确结果 |
-| M3 | W7 末 | `ascend-oci-runtime` + demo | containerd 创建 Pod 能看到 NPU 设备 |
-| M4 | W11 末 | GitHub 开源项目 | README + 架构图 + 安全/性能测试报告 |
+| M1 | W2 末 | `ascend-ioctl-catalog.md` | 至少列出 10 个 ioctl 及用途 ✅（实际 80 种） |
+| M2 | W5 末 | `ascend-ioctl-proxy` (C 独立分支) | 能代理 3 种以上 ioctl 并返回正确结果 |
+| M3 | W8 末 | `docs/gvisor-integration-analysis.md` | 方案可执行 + 接口定义完备 |
+| M4 | W14 末 | gVisor fork + `runsc --ascendproxy` | torch_npu 在 gVisor 里能完成推理 |
 
 ---
 
