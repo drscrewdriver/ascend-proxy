@@ -49,12 +49,77 @@
 
 ## 2. Sentry device 注册机制（阶段三调研）
 
-> TODO: 读 `pkg/sentry/vfs/` 和 `pkg/sentry/devices/nvproxy/` 后填写
+> 基于 gVisor master 分支源码阅读（本地 `~/dev/gvisor`，2026-10-24）
 
-- [ ] Device 接口定义（`Open/Read/Write/Ioctl` 方法签名）
-- [ ] 设备注册时机（`platform.Init` 阶段？）
-- [ ] fd table 与 device 绑定
-- [ ] Ioctl 分发的具体路径
+### 2.1 nvproxy 文件布局（实际 7593 行 Go，20 个文件）
+
+| 文件 | 行数 | 作用 |
+|------|------|------|
+| `nvproxy.go` | 333 | 总入口 + `Register(vfsObj, opts)` 设备注册 |
+| `handlers.go` | 156 | ioctl handler 定义 + 能力掩码 |
+| `object.go` | 428 | 设备 fd 对象（实现 vfs.FileOperations） |
+| `frontend.go` + `frontend_unsafe.go` | ~1170 | host frontend 子进程 + 真 ioctl 转发 |
+| `seccomp_filters.go` | 161 | 对 frontend 自己限制的 seccomp 规则 |
+| `version.go` | 1533 | NVIDIA 驱动版本 → ABI 映射表 |
+| `uvm.go` + `uvm_*.go` | ~800 | UVM (Unified Virtual Memory) 子系统 |
+
+### 2.2 关键发现 1：双向 seccomp 隔离
+
+`seccomp_filters.go` 显示 gVisor **不只限制容器，还限制 frontend 自己**：
+
+```go
+func frontendIoctlFilters(enabledCaps nvconf.DriverCaps) []seccomp.SyscallRule {
+    var ioctlRules []seccomp.SyscallRule
+    for _, feIoctl := range []struct{ ... }{
+        // 逐个枚举允许 frontend 执行的 ioctl 编号
+    }
+    // 拼成 syscall.Rule，仅允许 ioctl syscall + 精确命中的编号
+}
+```
+
+**启示**：ascend-proxy 集成时应该双白名单：
+- Sentry 侧（容器能发什么 ioctl）
+- Frontend 侧（能代执行什么） — 避免 Sentry 自身被攻击后滥用特权
+
+### 2.3 关键发现 2：capability 能力掩码
+
+`handlers.go`：
+
+```go
+type frontendIoctlHandler struct {
+    handler func(*frontendIoctlState) (uintptr, error)
+    capSet  nvconf.DriverCaps    // 位掩码
+}
+
+func feHandler(h func(*frontendIoctlState) (uintptr, error),
+               caps nvconf.DriverCaps) frontendIoctlHandler {
+    return frontendIoctlHandler{h, caps}
+}
+```
+
+**启示**：我们的白名单应扩展为 `(magic, nr, capability)` 三元组。不同部署场景（推理/训练/多卡）可开关不同能力，与阶段一发现的 HCCL 边界自然对应。
+
+### 2.4 关键发现 3：ABI 版本绑定
+
+`nvproxy.go:Register` 入口：
+
+```go
+abiEntry, ok := abis[opts.DriverVersion]
+if !ok {
+    return nil, fmt.Errorf("unsupported Nvidia driver version: %s", opts.DriverVersion)
+}
+```
+
+**启示**：ascendproxy 需绑 CANN 版本。当前实测环境：CANN 9.1.0 + 910B2 + driver 25.2.1，`version.go` 先写单一入口。
+
+### 2.5 待调研项（下一步）
+
+- [ ] `object.go` 中的 `deviceFile` 实现（对应我们的 davinciFD）
+- [ ] `frontendIoctlState` 字段定义 + 参数传递方式（memfd or direct）
+- [ ] `save_restore.go` 序列化机制（影响 checkpoint/restore）
+- [ ] Sentry 主循环集成点（`pkg/sentry/sentry.go`）
+
+**产出计划**：写 `docs/nvproxy-annotated.md` 逐段注释 nvproxy.go + object.go + handlers.go 作为实现参考。
 
 ---
 
