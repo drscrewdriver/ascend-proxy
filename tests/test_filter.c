@@ -9,11 +9,15 @@
  *   - 载入 cmd，提取 magic，应正确命中 8 个 magic 之一
  *   - 命中后应落到 NOTIF；未命中应落到 ALLOW
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#include <sys/syscall.h>
+#include <asm/unistd.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <linux/ioctl.h>
@@ -29,12 +33,16 @@
 #define OFF_NR   offsetof(struct seccomp_data, nr)
 #define OFF_CMD  offsetof(struct seccomp_data, args[1])
 
+#ifndef BPF_JNE
+#define BPF_JNE 0x50
+#endif
+
 static struct sock_filter FILTER[] = {
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_NR),
     BPF_JUMP(BPF_JMP | BPF_JNE | BPF_K, __NR_ioctl, 13, 0),
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_CMD),
-    BPF_ALU(BPF_ALU | BPF_RSH | BPF_K, 8, 0),
-    BPF_ALU(BPF_ALU | BPF_AND | BPF_K, 0xFF, 0),
+    BPF_STMT(BPF_ALU | BPF_RSH | BPF_K, 8),
+    BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0xFF),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ASCEND_MAGIC_INIT,    8, 0),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ASCEND_MAGIC_HDC,     7, 0),
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ASCEND_MAGIC_CORE,    6, 0),
@@ -78,7 +86,7 @@ static int simulate(uint32_t syscall_nr, uint32_t cmd) {
         }
 
         switch (cls) {
-            case 0x01: /* BPF_LD (with BPF_W|BPF_ABS) */
+            case 0x00: /* BPF_LD (with BPF_W|BPF_ABS) */
                 if (k == OFF_NR) A = syscall_nr;
                 else if (k == OFF_CMD) A = cmd;
                 pc++;

@@ -7,10 +7,10 @@
 #include <stddef.h>
 #include "whitelist.h"
 
-/* 简化宏：dir 0=NONE 1=WRITE 2=READ 3=RW */
-#define E(mg, nr, dir, sz, act, sec, desc) \
-    { .magic = (mg), .nr = (nr), .dir = (dir), .size = (sz), \
-      .action = (act), .sec = (sec), .desc = (desc) }
+/* 简化宏：dir_ 参数避免与结构体 designator .dir 同名导致预处理器误替换 */
+#define E(mgc, nr_, dr_, sz_, act_, sec_, desc_) \
+    { .magic = (mgc), .nr = (nr_), .dir = (dr_), .size = (sz_), \
+      .action = (act_), .sec = (sec_), .desc = (desc_) }
 
 #define A   PROXY_ALLOW
 #define X   PROXY_DENY

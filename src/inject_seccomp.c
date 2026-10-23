@@ -16,7 +16,9 @@
  *
  * 编译：gcc -shared -fPIC -O2 -Wall -o inject_seccomp.so inject_seccomp.c
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +29,8 @@
 #include <sys/un.h>
 #include <sys/prctl.h>
 #include <sys/ioctl.h>
+#include <sys/syscall.h>
+#include <asm/unistd.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
 #include <linux/audit.h>
@@ -34,17 +38,20 @@
 
 #include "common.h"
 
-/* ============================================================
- * seccomp BPF 常量（部分 header 未导出）
- * ============================================================ */
+/* cBPF 经典指令集没有 BPF_JNE（那是 eBPF 的）；自己定义 */
+#ifndef BPF_JNE
+#define BPF_JNE 0x50
+#endif
+
+#ifndef SECCOMP_SET_MODE_FILTER
+#define SECCOMP_SET_MODE_FILTER 1
+#endif
+
 #ifndef SECCOMP_RET_USER_NOTIF
 #define SECCOMP_RET_USER_NOTIF 0x7fc00000U
 #endif
 #ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
 #define SECCOMP_FILTER_FLAG_NEW_LISTENER (1UL << 3)
-#endif
-#ifndef SECCOMP_SET_MODE_FILTER
-#define SECCOMP_SET_MODE_FILTER 1
 #endif
 
 /* ============================================================
@@ -82,9 +89,9 @@ static struct sock_filter g_filter[] = {
     BPF_STMT(BPF_LD | BPF_W | BPF_ABS, OFF_CMD),
 
     /* [3] A >>= 8 */
-    BPF_ALU(BPF_ALU | BPF_RSH | BPF_K, 8, 0),
+    BPF_STMT(BPF_ALU | BPF_RSH | BPF_K, 8),
     /* [4] A &= 0xFF → A = magic byte */
-    BPF_ALU(BPF_ALU | BPF_AND | BPF_K, 0xFF, 0),
+    BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0xFF),
 
     /* [5-12] 比较 8 个 magic，命中则跳到 NOTIF([14]) */
     BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ASCEND_MAGIC_INIT,    8, 0),  /* → [14] */
@@ -150,8 +157,9 @@ static int install_seccomp_and_connect(void) {
     };
 
     /* 3. 装 filter 并要求返回 listener fd */
-    int listener = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
-                           SECCOMP_FILTER_FLAG_NEW_LISTENER, &prog);
+    long r = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+                     SECCOMP_FILTER_FLAG_NEW_LISTENER, &prog);
+    int listener = (r < 0) ? -1 : (int)r;
     if (listener < 0) {
         fprintf(stderr, "[inject] seccomp(SET_MODE_FILTER, NEW_LISTENER): %s\n",
                 strerror(errno));

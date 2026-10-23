@@ -10,7 +10,9 @@
  * 编译：gcc -O2 -Wall -o ascend-proxy proxy_main.c whitelist.c -lpthread
  * 需要：root 或 CAP_SYS_ADMIN + CAP_SYS_PTRACE
  */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,7 +37,7 @@
 #include "whitelist.h"
 
 /* ============================================================
- * seccomp USER_NOTIF 结构体（部分 libc 未导出）
+ * seccomp USER_NOTIF 兼容包装（部分 libc 未导出常量）
  * ============================================================ */
 #ifndef SECCOMP_FILTER_FLAG_NEW_LISTENER
 #define SECCOMP_FILTER_FLAG_NEW_LISTENER (1UL << 3)
@@ -45,28 +47,18 @@
 #define SECCOMP_RET_USER_NOTIF 0x7fc00000U
 #endif
 
-struct seccomp_notif_resp {
-    __u64 id;
-    __s64 val;
-    __s32 error;
-    __u32 flags;
-};
-
 #ifndef SECCOMP_USER_NOTIF_FLAG_CONTINUE
 #define SECCOMP_USER_NOTIF_FLAG_CONTINUE (1UL << 0)
 #endif
 
 #ifndef SECCOMP_IOCTL_NOTIF_RECV
-#define SECCOMP_IOCTL_NOTIF_RECV \
-    _IOWR('!', 0, struct seccomp_notif)
+#define SECCOMP_IOCTL_NOTIF_RECV _IOWR('!', 0, struct seccomp_notif)
 #endif
 #ifndef SECCOMP_IOCTL_NOTIF_SEND
-#define SECCOMP_IOCTL_NOTIF_SEND \
-    _IOWR('!', 1, struct seccomp_notif_resp)
+#define SECCOMP_IOCTL_NOTIF_SEND _IOWR('!', 1, struct seccomp_notif_resp)
 #endif
 #ifndef SECCOMP_IOCTL_NOTIF_ID_VALID
-#define SECCOMP_IOCTL_NOTIF_ID_VALID \
-    _IOW('!', 2, __u64)
+#define SECCOMP_IOCTL_NOTIF_ID_VALID _IOW('!', 2, __u64)
 #endif
 
 /* ============================================================
@@ -79,7 +71,6 @@ static int g_epoll_fd   = -1;
 static volatile int g_running = 1;
 
 static int g_verbose = 0;
-static int g_stats_only = 0;
 
 /* 每个连接（容器进程）一个 tracking 结构 */
 #define MAX_SESSIONS 64
@@ -228,7 +219,7 @@ static void handle_notif(struct session *sess) {
     if (sz > 0 && argp != 0) {
         buf = malloc(sz);
         if (!buf) { resp.error = -ENOMEM; goto send; }
-        if (read_remote_buf(req.pid, argp, buf, sz) < 0) {
+        if (read_remote_buf((pid_t)req.pid, argp, buf, sz) < 0) {
             logmsg("process_vm_readv failed: %s", strerror(errno));
             free(buf);
             resp.error = -EFAULT;
@@ -249,7 +240,7 @@ static void handle_notif(struct session *sess) {
 
     /* 若 dir 含 READ 位，把 buf 内容回写 */
     if (ret >= 0 && sz > 0 && buf && (_IOC_DIR(cmd) & _IOC_READ)) {
-        if (write_remote_buf(req.pid, argp, buf, sz) < 0) {
+        if (write_remote_buf((pid_t)req.pid, argp, buf, sz) < 0) {
             logmsg("process_vm_writev failed: %s", strerror(errno));
         }
     }
