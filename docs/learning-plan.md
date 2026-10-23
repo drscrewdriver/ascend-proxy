@@ -387,3 +387,132 @@ AI 提示词模板：
 | 定向抓 + AI 分析 | 1 天 | ¥36-86 | 80-90%（含归类） |
 
 > 先看头文件 = 知道要抓什么 = 不浪费机时盲等 = 省钱省时
+
+---
+
+## 阶段一实际进展（截至 2026-10-24）
+
+> 阶段一已基本完成。以下为实际执行结果和后续补全计划。
+
+### 已完成工作
+
+| 指标 | 数值 |
+|------|------|
+| LD_PRELOAD 确认 | **71 种** |
+| 二进制独有（运行时未触发） | 24 种 |
+| **总 ioctl 目录** | **95 种** |
+| hisi_hdc 覆盖率 | 18/18 (100%) |
+| davinci_manager 覆盖 | 53/~77 (69%) |
+| 0x5a 族 | LD_PRELOAD 首次确认 |
+| 0x89 族 | 仅二进制（需多卡 HCCL） |
+
+### 关键发现：LD_PRELOAD 优于 strace
+
+| 指标 | strace | LD_PRELOAD | 差异 |
+|------|--------|-----------|------|
+| 总调用次数 | 4332 | 5307 | +22% |
+| 唯一签名数 | 48 | **71** | **+48%** |
+| 0x4d 族 | 19 | 26 | +7 |
+| 0x48 族 | 9 | 18 | +9 |
+| 0x5a 族 | 0 | 2 | +2（首次确认） |
+
+**结论**：strace 对昇腾 NPU 设备的 ioctl 解码存在严重遗漏（~33%），LD_PRELOAD 是更可靠的抓取手段。
+
+### 抓取工具链
+
+| 工具 | 路径 | 用途 |
+|------|------|------|
+| LD_PRELOAD hook | `/tmp/ioctl_log.c` → `/tmp/ioctl_log.so` | 用户态 ioctl 全拦截 |
+| extract_npu_ioctl.py | `tools/extract_npu_ioctl.py` | strace 日志解析（v2） |
+| ascend-ioctl-capture-all.sh | `tools/ascend-ioctl-capture-all.sh` | 7 族定向抓取脚本 |
+| ioctl 目录文档 | `docs/ascend-ioctl-catalog.md` | 95 种 ioctl 完整目录 |
+
+---
+
+## 待补全计划
+
+### 计划 A：0x89 族探查（需单机多卡）
+
+> 0x89 族 6 种 ioctl（nr=0x0b/0x0c/0x13/0x14/0x16/0x1c）仅二进制分析可见，运行时未触发。
+> 推测为 HCCL 集合通信的设备发现/拓扑查询接口，需 ≥2 张 NPU 才能触发。
+
+**环境需求**：单机 2 卡昇腾 910B（AutoDL/共绩/极智算均有）
+
+**触发命令**：
+```bash
+LD_PRELOAD=/tmp/ioctl_log.so \
+torchrun --nproc_per_node=2 --master_addr=127.0.0.1 --master_port=29500 -c "
+import torch, torch_npu, torch.distributed as dist
+dist.init_process_group(backend='hccl')
+x = torch.randn(64, device=f'npu:{dist.get_rank()}')
+dist.all_reduce(x)
+dist.destroy_process_group()
+" 2>/tmp/ioctl_2card.txt
+
+grep "\[IOCTL\]" /tmp/ioctl_2card.txt | awk '{print $3, $4}' | sort -u
+```
+
+**预计新增**：0x89 族 6 种 → 总目录从 95 种提升到 ~101 种
+
+### 计划 B：0x4d 剩余 17 种探查（更复杂负载）
+
+> 0x4d 族仍有 17 种二进制独有 ioctl 未触发（nr=0x11/0x12/0x15/0x16/0x1d/0x1e/0x20/0x33/0x35/0x36/0x3f/0x4c/0x4d/0x51/0x56/0x5a/0x5b/0x5c/0x61/0x62/0x64/0x68/0x69/0x6a/0x74/0x76/0x94/0x9e/0x9f/0xa0/0xa3/0xaf/0xb9）。
+> 可能需要更复杂的模型推理（Transformer/训练循环）或模型加载（.om 格式）才能触发。
+
+**触发负载**：
+```bash
+LD_PRELOAD=/tmp/ioctl_log.so python3 -c "
+import torch, torch_npu
+
+# Transformer 层
+model = torch.nn.TransformerEncoderLayer(
+    d_model=512, nhead=8, dim_feedforward=2048, batch_first=True
+).npu().eval()
+x = torch.randn(4, 128, 512, device='npu:0')
+y = model(x)
+
+# 训练循环
+model2 = torch.nn.Sequential(
+    torch.nn.Linear(512, 256), torch.nn.ReLU(), torch.nn.Linear(256, 10)
+).npu()
+opt = torch.optim.AdamW(model2.parameters(), lr=1e-3)
+for i in range(10):
+    inp = torch.randn(32, 512, device='npu:0')
+    target = torch.randint(0, 10, (32,), device='npu:0')
+    loss = torch.nn.CrossEntropyLoss()(model2(inp), target)
+    opt.zero_grad(); loss.backward(); opt.step()
+
+# 模型保存/加载
+torch.save(model2.state_dict(), '/tmp/model.pt')
+model2.load_state_dict(torch.load('/tmp/model.pt'))
+
+# 内存操作
+torch.npu.empty_cache()
+torch.npu.reset_peak_memory_stats()
+print('DONE')
+" 2>/tmp/ioctl_complex.txt
+
+grep "\[IOCTL\]" /tmp/ioctl_complex.txt | awk '{print $3, $4}' | sort -u
+```
+
+### 计划 C：/dev/devmm_svm 探查（需权限）
+
+> `/dev/devmm_svm` (502:0) 虚拟内存管理设备当前权限不足无法 open。
+> 获取 root 或调整权限后，可能有新的 ioctl 编号。
+
+```bash
+# 检查权限
+ls -la /dev/devmm_svm
+# 尝试 open（需 root 或设备权限）
+python3 -c "import os; fd = os.open('/dev/devmm_svm', os.O_RDWR); print(f'fd={fd}')"
+```
+
+### 优先级排序
+
+| 优先级 | 计划 | 预计新增 | 难度 | 成本 |
+|--------|------|---------|------|------|
+| P1 | A: 0x89 族（单机 2 卡） | ~6 种 | 低 | ¥5-10/时 |
+| P2 | B: 0x4d 剩余（复杂负载） | ~5-10 种 | 中 | 当前容器可跑 |
+| P3 | C: devmm_svm（需权限） | 未知 | 高 | 需特殊环境 |
+
+**建议**：先跑 P2（当前容器即可），再租 2 卡机跑 P1。P3 留作后续。
