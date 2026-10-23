@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Trace logs (large)
+*.log
+trace_*/
+/tmp/
+
+# Binaries
+*.o
+*.so
+*.ko
