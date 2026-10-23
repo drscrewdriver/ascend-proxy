@@ -22,3 +22,14 @@ trace_*/
 *.o
 *.so
 *.ko
+
+# Build artifacts
+build/
+bin/
+coverage/
+*.gcda
+*.gcno
+*.gcov
+
+# ASan logs
+*.asan.log.*
