@@ -112,14 +112,78 @@ if !ok {
 
 **启示**：ascendproxy 需绑 CANN 版本。当前实测环境：CANN 9.1.0 + 910B2 + driver 25.2.1，`version.go` 先写单一入口。
 
-### 2.5 待调研项（下一步）
+### 2.5 深入阅读：frontendFD.Ioctl 实现（frontend.go:213）
 
-- [ ] `object.go` 中的 `deviceFile` 实现（对应我们的 davinciFD）
-- [ ] `frontendIoctlState` 字段定义 + 参数传递方式（memfd or direct）
+实际代码发现 nvproxy **不存在独立 frontend 进程**（与早期 gVisor 文档不同），当前实现是：
+
+```go
+// frontend.go:213 — Sentry 内部直接执行
+func (fd *frontendFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr,
+                            args arch.SyscallArguments) (uintptr, error) {
+    cmd := args[1].Uint()
+    nr := linux.IOC_NR(cmd)
+    // …
+    result, err := fd.dev.nvp.abi.frontendIoctl[nr].handle(&fi)
+}
+
+// frontend_unsafe.go:41 — 实际调用真 ioctl
+func frontendIoctlInvokeNoStatus(...) {
+    n, _, errno := unix.RawSyscall(
+        unix.SYS_IOCTL,
+        uintptr(fi.fd.hostFD),              // ← Sentry 持有的真 host fd
+        frontendIoctlCmd(fi.nr, fi.ioctlParamsSize),
+        uintptr(unsafe.Pointer(ioctlParams)))
+}
+```
+
+**含义**：Sentry 自己持有 /dev/nvidia* 的 host fd，直接 RawSyscall。安全性靠：
+1. Sentry 自己的 **seccomp filter**（限制 Sentry 能向 host 发哪些 ioctl）
+2. Sentry 内部的 **ABI 分发表**（`abi.frontendIoctl[nr]`）
+
+### 2.6 深入阅读：参数传递模式（frontendIoctlSimple）
+
+```go
+func frontendIoctlSimple[Params any, PtrParams hasStatusPtr[Params]](
+    fi *frontendIoctlState) (uintptr, error) {
+    var ioctlParamsValue Params
+    ioctlParams := PtrParams(&ioctlParamsValue)
+    if int(fi.ioctlParamsSize) != ioctlParams.SizeBytes() { return 0, linuxerr.EINVAL }
+    ioctlParams.CopyIn(fi.t, fi.ioctlParamsAddr)    // 容器内存 → Go 结构体
+    n, err := frontendIoctlInvoke(fi, ioctlParams)  // 真 ioctl
+    ioctlParams.CopyOut(fi.t, fi.ioctlParamsAddr)   // Go 结构体 → 容器内存
+    return n, nil
+}
+```
+
+使用 **Go 泛型 + marshal 接口**，每个参数类型只需声明 `CopyIn/CopyOut`，handler 代码不到 15 行。
+
+**启示**：ascendproxy 中我们需为 6 个常见 size（0 / 4 / 8 / 0x14 / 0x1c / 0x34 / 0x5c / 0x108 / 0x158）定义对应结构体。无结构体时退化为 opaque blob。与阶段二 `process_vm_readv/writev` 同语义，但 Sentry 内部无跨进程开销。
+
+### 2.7 runsc CLI 层集成链路（阶段 C）
+
+```
+runsc --nvproxy          ┐
+                          │  runsc/config/config.go 定义 flag
+OCI spec annotation       │  runsc/specutils/nvidia.go:NVProxyEnabled()
+  ↓                        │
+boot.NewSentry()         │  runsc/boot/loader.go
+  ↓                        │
+nvproxy.Register(vfs, opts)   ← 入口！我们写 ascendproxy.Register 同位
+  ↓                        │
+创建 frontendDevice{minor}, 注册到 virtualFilesystem
+  ↓                        │
+容器 open("/dev/nvidia0") → Sentry VFS 匹配到 frontendDevice →
+返回 frontendFD，后续 ioctl 自动分发到 frontendFD.Ioctl
+```
+
+关键 API：`vfs.VirtualFilesystem.RegisterDeviceAtPath("/dev/davinci_manager", &davinciDevice{})`
+
+### 2.8 待调研项（下一步）
+
+- [ ] `object.go` 中的 `deviceFile` 实现与 `nvproxy.object` 关系（尚不确定需不需要 object tracking）
 - [ ] `save_restore.go` 序列化机制（影响 checkpoint/restore）
-- [ ] Sentry 主循环集成点（`pkg/sentry/sentry.go`）
-
-**产出计划**：写 `docs/nvproxy-annotated.md` 逐段注释 nvproxy.go + object.go + handlers.go 作为实现参考。
+- [ ] `pkg/abi/nvgpu/` 里的结构体定义风格（需为昇腾写 `pkg/abi/davinci/`）
+- [ ] `pkg/sentry/devices/BUILD` 自动发现机制
 
 ---
 
@@ -262,3 +326,24 @@ nvproxy 用**匿名共享内存 (memfd)** + **ioctl on listener fd** 传递：
 ## 9. 更新日志
 
 - 2026-10-24 骨架创建（阶段二完成后）
+- 2026-10-24 阶段三 W6 完成：gVisor 源码获取 + nvproxy 精读 A+C
+  * `~/dev/gvisor` 88MB 就位（codeload tar.gz）
+  * Bazel 8.8.1 安装（ghproxy 镜像）
+  * nvproxy 发现：不存在独立 frontend 进程，Sentry 直接 RawSyscall
+  * frontendIoctlSimple 使用 Go 泛型 + marshal 接口
+  * runsc CLI 链路：flag → NVProxyEnabled → Register(vfs)
+  * **构建卡住**：bazel build 需拉 protobuf，GitHub 不稳。待网络良好时重跑
+
+---
+
+## 10. 开发环境现状
+
+| 项 | 状态 | 位置 |
+|----|------|------|
+| gVisor 源码 | ✅ 已获取 | `~/dev/gvisor` (WSL2) |
+| Go 1.22 | ✅ | `/usr/bin/go` |
+| Bazel 8.8.1 | ✅ | `~/.local/bin/bazel` |
+| `bazel build //:runsc` | ⚠️ 卡在 protobuf 下载 | 需 GitHub 可达 |
+| 阅读代码 | ✅ | 不依赖 build |
+
+**结论**：代码阅读不依赖 bazel build 成功。集成开发（阶段 4b）时需先解决 bazel 镜像。方案：配 `BAZEL_PATH` 指向本地镜像，或直接用 gVisor 预构建的 `runsc` binary 验证。
