@@ -79,6 +79,15 @@ echo "已有: 84 种 (strace 46 + 二进制 38)"
 echo "新增: $(grep "_IOC" /tmp/ioctl_summary.txt | sort -u | wc -l) 种"
 ```
 
+# 昇腾 910B2 (CANN 9.1.0) 上 torch_npu 2.9.0 已知的算子崩溃问题：
+
+| 算子组合 | 现象 | 原因 | 影响 |
+|---------|------|------|------|
+| `Conv2d + BatchNorm2d + MaxPool` | 进程静默崩溃（无 traceback） | torch_npu 2.9.0 对 conv2d 的 NPU kernel 实现不完整 | 不影响 ioctl 抓取，已触发的 ioctl 仍有效 |
+| `aclrtRecordEvent` (ctypes) | Segmentation fault | ctypes 参数绑定不对（事件句柄类型错误） | 改用纯 torch_npu 负载绕过 |
+
+**结论**：这些是 torch_npu 算子层兼容性问题，与 ioctl 接口发现无关。用 `Linear + Transformer + 训练循环` 即可覆盖单卡全部推理/训练 ioctl 路径，无需 Conv2d。
+
 ## 省钱提示
 
 | 操作 | 建议 |
